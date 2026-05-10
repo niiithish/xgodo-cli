@@ -142,7 +142,8 @@ function getSourceDir(config) {
 
 const DEFAULT_IGNORE = [
   '.git', 'node_modules', '.gitignore',
-  '.xgodo.json', '.xgodoignore', 'package-lock.json',
+  '.xgodo.json', '.xgodoignore',
+  'package.json', 'package-lock.json',
   'AGENTS.md', 'global.d.ts', '*.d.ts',
 ];
 
