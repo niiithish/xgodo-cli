@@ -18,6 +18,7 @@ const http = require('http');
 // ─── Config ───────────────────────────────────────────────
 
 const CONFIG_FILE = '.xgodo.json';
+const CACHE_FILE = '.xgodo-cache.json';
 const GLOBAL_CONFIG = path.join(process.env.HOME || '~', '.xgodo.json');
 
 function findConfig() {
@@ -133,6 +134,46 @@ async function gitCommit(config, message) {
   return res;
 }
 
+// ─── Local State Cache ──────────────────────────────
+
+function findConfigDir() {
+  let dir = process.cwd();
+  while (dir !== '/') {
+    if (fs.existsSync(path.join(dir, CONFIG_FILE))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return process.cwd();
+}
+
+function loadCache() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(findConfigDir(), CACHE_FILE), 'utf8'));
+  } catch {
+    return { files: {} };
+  }
+}
+
+function saveCache(cache) {
+  fs.writeFileSync(path.join(findConfigDir(), CACHE_FILE), JSON.stringify(cache, null, 2));
+}
+
+function fileHash(content) {
+  const crypto = require('crypto');
+  return crypto.createHash('md5').update(content).digest('hex');
+}
+
+function hashLocalFiles(config) {
+  const files = getLocalFiles(config);
+  const result = {};
+  for (const f of files) {
+    const content = readLocalFile(config, f);
+    if (content !== null) result[f] = fileHash(content);
+  }
+  return result;
+}
+
 // ─── Local File Helpers ────────────────────────────────────
 
 function getSourceDir(config) {
@@ -142,7 +183,7 @@ function getSourceDir(config) {
 
 const DEFAULT_IGNORE = [
   '.git', 'node_modules', '.gitignore',
-  '.xgodo.json', '.xgodoignore',
+  '.xgodo.json', '.xgodoignore', '.xgodo-cache.json',
   'package.json', 'package-lock.json',
   'AGENTS.md', 'global.d.ts', '*.d.ts',
 ];
@@ -210,17 +251,27 @@ async function cmdPush(config, message, flags) {
   const noDelete = flags.includes('--no-delete');
   const force = flags.includes('--force') || flags.includes('-f');
   const dryRun = flags.includes('--dry-run');
+  const full = flags.includes('--full');
 
   const localFiles = getLocalFiles(config);
-  const remoteFilesRaw = await listFiles(config);
-  const remoteFiles = remoteFilesRaw.filter(f => f.type === 'file' && !f.isPairedJs).map(f => f.path);
-  const pairedJsFiles = remoteFilesRaw.filter(f => f.isPairedJs).map(f => f.path);
+  const cache = loadCache();
+  const localHashes = hashLocalFiles(config);
 
-  // Calculate what will be deleted
-  const toDelete = noDelete ? [] : remoteFiles.filter(f => !localFiles.includes(f) && !pairedJsFiles.includes(f));
-  const toUpload = localFiles;
+  // Determine what to upload, delete, and skip
+  let toUpload, toDelete;
 
-  console.log(`📁 Local: ${localFiles.length} files | Remote: ${remoteFiles.length} files`);
+  if (full) {
+    // --full: upload everything, ignore cache
+    toUpload = localFiles;
+    toDelete = [];
+    console.log('🔥 Full push — uploading all files...');
+  } else {
+    // Smart: compare against cache
+    const cachedFiles = Object.keys(cache.files);
+    toUpload = localFiles.filter(f => cache.files[f] !== localHashes[f]);
+    toDelete = noDelete ? [] : cachedFiles.filter(f => !localFiles.includes(f));
+    console.log(`📁 Local: ${localFiles.length} files | Cached: ${cachedFiles.length} files`);
+  }
 
   if (dryRun) {
     console.log(`\n🔍 DRY RUN — no changes will be made\n`);
@@ -231,11 +282,11 @@ async function cmdPush(config, message, flags) {
   }
 
   // Safety: warn if deleting many files
-  if (toDelete.length > 5 && !force) {
+  if (toDelete.length > 5 && !force && !full) {
     console.log(`\n⚠️  About to DELETE ${toDelete.length} remote files!`);
     toDelete.slice(0, 5).forEach(f => console.log(`     - ${f}`));
     if (toDelete.length > 5) console.log(`     ... and ${toDelete.length - 5} more`);
-    console.log(`\n   Use --force to confirm, or --no-delete to skip deletions.`);
+    console.log(`\n   Use --force to confirm, --no-delete to skip, or --full to re-upload everything.`);
     process.exit(1);
   }
 
@@ -281,6 +332,17 @@ async function cmdPush(config, message, flags) {
     console.log('\n✨ Nothing to commit — up to date.');
   }
 
+  // Update cache with current local state
+  if (uploaded > 0 || deleted > 0) {
+    if (full) {
+      cache.files = localHashes;
+    } else {
+      for (const f of toDelete) delete cache.files[f];
+      for (const f of toUpload) cache.files[f] = localHashes[f];
+    }
+    saveCache(cache);
+  }
+
   console.log(`\nDone: ${uploaded} uploaded, ${deleted} deleted.`);
 }
 
@@ -309,33 +371,31 @@ async function cmdPull(config) {
     }
   }
 
+  // Update cache with downloaded files
+  const cache = loadCache();
+  const localHashes = hashLocalFiles(config);
+  for (const f of tsFiles) {
+    if (localHashes[f.path]) cache.files[f.path] = localHashes[f.path];
+  }
+  saveCache(cache);
+
   console.log(`\nDone. Files saved to ${srcDir}/`);
 }
 
 async function cmdStatus(config) {
   const localFiles = getLocalFiles(config);
-  const remoteFilesRaw = await listFiles(config);
-  const remoteFiles = remoteFilesRaw.filter(f => f.type === 'file' && !f.isPairedJs).map(f => f.path);
+  const cache = loadCache();
+  const cachedFiles = Object.keys(cache.files);
+  const localHashes = hashLocalFiles(config);
 
-  console.log('🔍 Comparing local vs remote...\n');
+  console.log('🔍 Comparing local vs cache...\n');
 
-  // New locally (not on remote)
-  const newLocal = localFiles.filter(f => !remoteFiles.includes(f));
-  // Modified (content differs)
-  const modified = [];
-  for (const file of localFiles.filter(f => remoteFiles.includes(f))) {
-    const localContent = readLocalFile(config, file);
-    try {
-      const remote = await getFile(config, file);
-      if (localContent !== remote.content) {
-        modified.push(file);
-      }
-    } catch (e) {
-      modified.push(file);
-    }
-  }
-  // Deleted locally (still on remote)
-  const deleted = remoteFiles.filter(f => !localFiles.includes(f));
+  // New: in local but not in cache
+  const newLocal = localFiles.filter(f => !(f in cache.files));
+  // Modified: both in cache and local, but hash differs
+  const modified = localFiles.filter(f => (f in cache.files) && cache.files[f] !== localHashes[f]);
+  // Deleted: in cache but not in local
+  const deleted = cachedFiles.filter(f => !localFiles.includes(f));
 
   if (newLocal.length > 0) {
     console.log('  🆕 New files (will be created):');
@@ -353,7 +413,7 @@ async function cmdStatus(config) {
     console.log('  ✅ Up to date. No changes.');
   }
 
-  // Also show remote git status
+  // Also show remote git status (uncommitted changes on xgodo)
   try {
     const status = await gitStatus(config);
     if (status.hasChanges) {
@@ -405,6 +465,7 @@ Usage:
             --dry-run       Show what would change without doing it
             --no-delete     Skip deleting remote files
             --force, -f     Skip safety confirmation for bulk deletes
+            --full          Upload ALL files, ignore cache (use if remote got out of sync)
   xgodo pull [-p <id>]      Download remote files to local
   xgodo status [-p <id>]    Show diff between local and remote
   xgodo help                Show this help
