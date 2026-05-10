@@ -1,0 +1,19 @@
+{
+  "name": "xgodo",
+  "version": "1.0.0",
+  "description": "CLI tool to sync local project files with xgodo.com online IDE",
+  "main": "index.js",
+  "bin": {
+    "xgodo": "./index.js"
+  },
+  "scripts": {
+    "push": "node index.js push",
+    "pull": "node index.js pull",
+    "status": "node index.js status"
+  },
+  "keywords": ["xgodo", "cli", "sync", "ide"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
